@@ -6,8 +6,8 @@
 
 - **Web 框架**: FastAPI
 - **向量数据库**: ChromaDB
-- **Embedding**: 智谱 API (embedding-3)
-- **LLM**: Kimi/Moonshot API (moonshot-v1-8k)
+- **Embedding**: OpenAI 兼容 API（默认智谱 embedding-3，可切换为 OpenAI / Cohere 等）
+- **LLM**: OpenAI 兼容 API（默认 Kimi moonshot-v1-8k，可切换为 OpenAI / DeepSeek 等）
 - **缓存/会话**: Redis
 - **限流**: slowapi
 
@@ -22,9 +22,19 @@ pip install -r requirements.txt
 ### 2. 配置环境变量
 
 ```bash
-# 必填 - LLM 和 Embedding API 密钥
-export LLM_API_KEY="your_kimi_api_key"
-export EMBED_API_KEY="your_zhipu_api_key"
+# 必填 - LLM API 密钥（支持任何 OpenAI 兼容接口）
+export LLM_API_KEY="your_llm_api_key"
+
+# 必填 - Embedding API 密钥（支持任何 OpenAI 兼容接口）
+export EMBED_API_KEY="your_embedding_api_key"
+
+# 可选 - 自定义 API 地址（默认分别为 Kimi 和 智谱）
+# export LLM_API_BASE="https://api.openai.com/v1"
+# export EMBED_API_BASE="https://api.openai.com/v1"
+
+# 可选 - 自定义模型名称（默认分别为 moonshot-v1-8k 和 embedding-3）
+# export LLM_MODEL="gpt-4o-mini"
+# export EMBED_MODEL="text-embedding-3-small"
 
 # 可选 - 坐席工作台密码（默认 changeme）
 export AGENT_PASSWORD="your_password"
@@ -259,8 +269,12 @@ websocat ws://localhost:8901/ws/user/test_session
 
 | 变量 | 必填 | 说明 | 默认值 |
 |------|------|------|--------|
-| `LLM_API_KEY` | ✅ | Kimi/Moonshot API 密钥 | 无 |
-| `EMBED_API_KEY` | ✅ | 智谱 Embedding API 密钥 | 无 |
+| `LLM_API_KEY` | ✅ | LLM API 密钥 | 无 |
+| `LLM_API_BASE` | ❌ | LLM API 地址（OpenAI 兼容） | https://api.moonshot.cn/v1 |
+| `LLM_MODEL` | ❌ | LLM 模型名称 | moonshot-v1-8k |
+| `EMBED_API_KEY` | ✅ | Embedding API 密钥 | 无 |
+| `EMBED_API_BASE` | ❌ | Embedding API 地址（OpenAI 兼容） | https://open.bigmodel.cn/api/paas/v4 |
+| `EMBED_MODEL` | ❌ | Embedding 模型名称 | embedding-3 |
 | `AGENT_PASSWORD` | ❌ | 坐席工作台登录密码 | changeme |
 | `REDIS_URL` | ❌ | Redis 连接地址 | redis://localhost:6379/0 |
 | `RATE_LIMIT` | ❌ | 限流（请求/分钟） | 20/minute |
