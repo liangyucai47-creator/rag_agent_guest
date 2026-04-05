@@ -38,12 +38,12 @@ import redis
 # ============================================================
 
 # LLM（Kimi）
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "sk-ioLLNXeBiC6r7UjrbfN8b8MzacZ3VayvvqKj1PBZ7G1yQJg6")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_API_BASE = os.environ.get("LLM_API_BASE", "https://api.moonshot.cn/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "moonshot-v1-8k")
 
 # Embedding（智谱）
-EMBED_API_KEY = os.environ.get("EMBED_API_KEY", "7efb744022204110a0202b0a77794b72.IOYX4nJnHIYhT9Ow")
+EMBED_API_KEY = os.environ.get("EMBED_API_KEY", "")
 EMBED_API_BASE = os.environ.get("EMBED_API_BASE", "https://open.bigmodel.cn/api/paas/v4")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "embedding-3")
 
@@ -819,7 +819,7 @@ async def ws_chat(ws: WebSocket):
 # --- 转人工（坐席系统）---
 
 # 坐席配置
-AGENT_PASSWORD = os.environ.get("AGENT_PASSWORD", "admin123")  # 坐席登录密码
+AGENT_PASSWORD = os.environ.get("AGENT_PASSWORD", "changeme")  # 坐席登录密码
 # 在线坐席 {agent_id: WebSocket}
 _online_agents: Dict[str, WebSocket] = {}
 # 会话状态 {session_id: {"status": str, "agent_id": str|None, "user_ws": WebSocket|None, "joined_at": float}}

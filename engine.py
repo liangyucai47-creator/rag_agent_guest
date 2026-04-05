@@ -20,7 +20,7 @@ from openai import OpenAI
 # === 配置 ===
 
 LLM_CONFIG = {
-    "api_key": os.environ.get("LLM_API_KEY", "sk-ioLLNXeBiC6r7UjrbfN8b8MzacZ3VayvvqKj1PBZ7G1yQJg6"),
+    "api_key": os.environ.get("LLM_API_KEY", ""),
     "api_base": os.environ.get("LLM_API_BASE", "https://api.moonshot.cn/v1"),
     "model": os.environ.get("LLM_MODEL", "moonshot-v1-8k"),
     "temperature": 0.3,
@@ -29,7 +29,7 @@ LLM_CONFIG = {
 
 # Embedding 配置：用 OpenAI 兼容 API（DeepSeek/硅基流动等都支持）
 EMBEDDING_CONFIG = {
-    "api_key": os.environ.get("EMBEDDING_API_KEY", "7efb744022204110a0202b0a77794b72.IOYX4nJnHIYhT9Ow"),
+    "api_key": os.environ.get("EMBEDDING_API_KEY", ""),
     "api_base": os.environ.get("EMBEDDING_API_BASE", "https://open.bigmodel.cn/api/paas/v4"),
     "model": os.environ.get("EMBEDDING_MODEL", "embedding-3"),
     "use_local": os.environ.get("EMBEDDING_USE_LOCAL", "false").lower() == "true",
