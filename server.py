@@ -809,7 +809,194 @@ async def ws_chat(ws: WebSocket):
         pass
 
 
-# --- 知识库管理 ---
+# --- 转人工（坐席系统）---
+
+# 坐席配置
+AGENT_PASSWORD = os.environ.get("AGENT_PASSWORD", "admin123")  # 坐席登录密码
+# 在线坐席 {agent_id: WebSocket}
+_online_agents: Dict[str, WebSocket] = {}
+# 会话状态 {session_id: {"status": str, "agent_id": str|None, "user_ws": WebSocket|None, "joined_at": float}}
+_session_states: Dict[str, Dict] = {}
+
+@app.get("/agent")
+def agent_page():
+    """坐席工作台页面"""
+    return FileResponse(str(BASE_DIR / "static" / "agent.html"))
+
+
+@app.post("/api/agent/login")
+def agent_login(password: str):
+    """坐席登录验证"""
+    if password == AGENT_PASSWORD:
+        import uuid
+        agent_id = str(uuid.uuid4())[:8]
+        return {"agent_id": agent_id, "status": "ok"}
+    raise HTTPException(403, "密码错误")
+
+
+@app.websocket("/ws/agent/{agent_id}")
+async def ws_agent(ws: WebSocket, agent_id: str):
+    """坐席 WebSocket 长连接"""
+    await ws.accept()
+    _online_agents[agent_id] = ws
+    print(f"[坐席] {agent_id} 上线，当前在线: {len(_online_agents)}")
+    await ws.send_json({"type": "online", "agent_id": agent_id, "queue_count": len(_session_states)})
+
+    try:
+        while True:
+            data = await ws.receive_text()
+            msg = json.loads(data)
+            action = msg.get("action")
+
+            if action == "accept":
+                # 接单：从排队中取出一个会话
+                session_id = msg.get("session_id")
+                state = _session_states.get(session_id)
+                if state and state["status"] == "waiting_human":
+                    state["status"] = "human_serving"
+                    state["agent_id"] = agent_id
+                    state["served_at"] = datetime.now().isoformat()
+                    # 通知用户
+                    if state.get("user_ws"):
+                        await state["user_ws"].send_json({"type": "agent_joined", "agent_id": agent_id})
+                    await ws.send_json({"type": "session_accepted", "session_id": session_id})
+                    print(f"[坐席] {agent_id} 接管会话 {session_id}")
+                else:
+                    await ws.send_json({"type": "error", "text": "会话不存在或已被接单"})
+
+            elif action == "message":
+                # 坐席发送消息给用户
+                session_id = msg.get("session_id")
+                text = msg.get("text", "")
+                state = _session_states.get(session_id)
+                if state and state.get("user_ws"):
+                    await state["user_ws"].send_json({"type": "agent_message", "text": text, "agent_id": agent_id})
+                    # 记录到会话历史
+                    if session_id:
+                        session_mgr.append(session_id, "assistant", text)
+                    # AI旁听：生成建议（异步，不阻塞）
+                    await asyncio.create_task(_ai_suggest(agent_id, session_id, text))
+                else:
+                    await ws.send_json({"type": "error", "text": "用户不在线"})
+
+            elif action == "end":
+                # 结束服务
+                session_id = msg.get("session_id")
+                state = _session_states.get(session_id)
+                if state:
+                    if state.get("user_ws"):
+                        await state["user_ws"].send_json({"type": "agent_left", "text": "人工客服已结束服务，感谢您的咨询！"})
+                    state["status"] = "ended"
+                    state["ended_at"] = datetime.now().isoformat()
+                    await ws.send_json({"type": "session_ended", "session_id": session_id})
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _online_agents.pop(agent_id, None)
+        # 把该坐席服务的会话标记为等待重新分配
+        for sid, state in _session_states.items():
+            if state.get("agent_id") == agent_id and state["status"] == "human_serving":
+                state["status"] = "waiting_human"
+                state["agent_id"] = None
+                if state.get("user_ws"):
+                    await state["user_ws"].send_json({"type": "waiting", "text": "坐席已断开，正在为您重新分配..."})
+        print(f"[坐席] {agent_id} 下线")
+
+
+async def _ai_suggest(agent_id: str, session_id: str, user_msg: str):
+    """AI旁听：给坐席推荐回复"""
+    try:
+        history = session_mgr.get_history(session_id) if session_id else []
+        candidates = kb.search(user_msg, top_k=3, expand=True)
+        if not candidates:
+            return
+        context = "\n".join([f"- {r['text'][:100]}" for r in candidates[:3]])
+        prompt = f"用户问题：{user_msg}\n\n参考信息：\n{context}\n\n请给客服一个简洁的回复建议（50字以内）："
+        resp = rag._llm.chat.completions.create(
+            model=LLM_MODEL, temperature=0.3, max_tokens=100,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        suggestion = resp.choices[0].message.content.strip()
+        if agent_id in _online_agents:
+            await _online_agents[agent_id].send_json({
+                "type": "ai_suggestion", "session_id": session_id,
+                "suggestion": suggestion
+            })
+    except Exception:
+        pass
+
+
+@app.post("/api/human/transfer")
+async def transfer_to_human(session_id: str, request: Request):
+    """用户请求转人工"""
+    state = _session_states.get(session_id)
+    if state and state["status"] == "human_serving":
+        return {"status": "already_serving", "agent_id": state.get("agent_id")}
+
+    # 创建排队记录
+    _session_states[session_id] = {
+        "status": "waiting_human",
+        "agent_id": None,
+        "user_ws": None,
+        "joined_at": datetime.now().isoformat(),
+    }
+
+    # 通知所有在线坐席
+    queue_count = sum(1 for s in _session_states.values() if s["status"] == "waiting_human")
+    for aid, ws in _online_agents.items():
+        try:
+            await ws.send_json({
+                "type": "new_queue",
+                "session_id": session_id,
+                "queue_count": queue_count,
+            })
+        except Exception:
+            pass
+
+    return {"status": "queued", "queue_position": queue_count}
+
+
+@app.get("/api/human/queue")
+def queue_status():
+    """查看排队状态"""
+    waiting = [{"session_id": sid, "joined_at": s["joined_at"]} for sid, s in _session_states.items() if s["status"] == "waiting_human"]
+    serving = [{"session_id": sid, "agent_id": s.get("agent_id")} for sid, s in _session_states.items() if s["status"] == "human_serving"]
+    return {"waiting": waiting, "serving": serving, "online_agents": len(_online_agents)}
+
+
+@app.websocket("/ws/user/{session_id}")
+async def ws_user(ws: WebSocket, session_id: str):
+    """用户 WebSocket（转人工后用）"""
+    await ws.accept()
+    state = _session_states.get(session_id)
+    if state:
+        state["user_ws"] = ws
+        if state["status"] == "human_serving" and state.get("agent_id"):
+            await ws.send_json({"type": "agent_joined", "agent_id": state["agent_id"]})
+        else:
+            await ws.send_json({"type": "waiting", "queue_position": sum(1 for s in _session_states.values() if s["status"] == "waiting_human")})
+
+    try:
+        while True:
+            data = await ws.receive_text()
+            msg = json.loads(data)
+            # 用户消息转发给坐席
+            state = _session_states.get(session_id)
+            if state and state["status"] == "human_serving" and state.get("agent_id"):
+                agent_id = state["agent_id"]
+                if agent_id in _online_agents:
+                    await _online_agents[agent_id].send_json({
+                        "type": "user_message", "session_id": session_id,
+                        "text": msg.get("text", "")
+                    })
+                    # 记录用户消息
+                    session_mgr.append(session_id, "user", msg.get("text", ""))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if state:
+            state["user_ws"] = None
 
 @app.get("/api/knowledge/stats")
 def knowledge_stats():

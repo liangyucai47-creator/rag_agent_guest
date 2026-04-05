@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>好运电商 - 坐席工作台</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root { --primary: #667eea; --bg: #f5f7fa; --card: #fff; --text: #2d3748; --text-light: #718096; --border: #e2e8f0; --success: #48bb78; --warning: #ed8936; --danger: #fc8181; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+
+/* 登录 */
+.login-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.login-box { background: var(--card); border-radius: 12px; padding: 40px; width: 360px; text-align: center; }
+.login-box h2 { margin-bottom: 20px; }
+.login-box input { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 12px; font-size: 14px; }
+.login-box .btn { width: 100%; padding: 10px; background: var(--primary); color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+.login-box .btn:hover { opacity: .9; }
+.login-box .error { color: var(--danger); font-size: 12px; margin-top: 8px; display: none; }
+
+/* Header */
+.header { background: linear-gradient(135deg, var(--primary) 0%, #764ba2 100%); color: white; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
+.header h1 { font-size: 1rem; }
+.header .info { font-size: .8rem; opacity: .9; }
+
+/* Layout */
+.main { flex: 1; display: flex; overflow: hidden; }
+
+/* Sidebar - Queue */
+.sidebar { width: 300px; background: var(--card); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+.sidebar-header { padding: 12px 16px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: .85rem; color: var(--text-light); text-transform: uppercase; }
+.queue-list { flex: 1; overflow-y: auto; }
+.queue-item { padding: 12px 16px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .2s; }
+.queue-item:hover { background: var(--bg); }
+.queue-item.active { background: #e8eaf6; border-left: 3px solid var(--primary); }
+.queue-item .name { font-weight: 600; font-size: .9rem; }
+.queue-item .time { font-size: .75rem; color: var(--text-light); }
+.queue-item .badge { display: inline-block; background: var(--warning); color: white; font-size: .7rem; padding: 1px 6px; border-radius: 3px; margin-left: 6px; }
+.badge-serving { background: var(--success); }
+.btn-accept { margin-top: 8px; padding: 4px 12px; background: var(--success); color: white; border: none; border-radius: 4px; cursor: pointer; font-size: .8rem; }
+.btn-end { margin-top: 8px; padding: 4px 12px; background: var(--danger); color: white; border: none; border-radius: 4px; cursor: pointer; font-size: .8rem; }
+
+/* Chat Area */
+.chat-area { flex: 1; display: flex; flex-direction: column; }
+.chat-header { padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--card); font-weight: 600; }
+.messages { flex: 1; overflow-y: auto; padding: 16px 24px; display: flex; flex-direction: column; gap: 12px; }
+.msg { max-width: 70%; padding: 10px 14px; border-radius: 10px; line-height: 1.5; font-size: .9rem; }
+.msg-user { align-self: flex-end; background: #e3f2fd; }
+.msg-agent { align-self: flex-start; background: var(--card); border: 1px solid var(--border); }
+.msg-system { align-self: center; background: #fff3e0; color: #e65100; font-size: .8rem; padding: 6px 12px; border-radius: 20px; }
+.msg-suggestion { align-self: flex-start; background: #e8f5e9; border: 1px solid #c8e6c9; font-size: .85rem; }
+.msg-suggestion .label { font-size: .75rem; color: #2e7d32; font-weight: 600; }
+.msg-suggestion .text { margin-top: 4px; }
+.msg-suggestion .adopt { margin-top: 6px; padding: 3px 10px; background: #2e7d32; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: .75rem; }
+
+.input-bar { padding: 12px 24px; background: var(--card); border-top: 1px solid var(--border); display: flex; gap: 10px; }
+.input-bar input { flex: 1; border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font-size: .9rem; }
+.input-bar button { padding: 8px 20px; background: var(--primary); color: white; border: none; border-radius: 6px; cursor: pointer; }
+
+.empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-light); }
+</style>
+</head>
+<body>
+
+<!-- 登录 -->
+<div class="login-overlay" id="loginOverlay">
+    <div class="login-box">
+        <h2>🔑 坐席登录</h2>
+        <input type="password" id="password" placeholder="输入坐席密码" onkeydown="if(event.key==='Enter')login()">
+        <button class="btn" onclick="login()">登录</button>
+        <div class="error" id="loginError">密码错误</div>
+    </div>
+</div>
+
+<div class="header">
+    <h1>🎧 好运电商 - 坐席工作台</h1>
+    <div class="info" id="headerInfo">未连接</div>
+</div>
+
+<div class="main">
+    <div class="sidebar">
+        <div class="sidebar-header">📋 排队 / 服务中</div>
+        <div class="queue-list" id="queueList">
+            <div style="padding: 40px 16px; text-align: center; color: var(--text-light); font-size: .85rem;">
+                暂无排队用户
+            </div>
+        </div>
+    </div>
+    <div class="chat-area" id="chatArea">
+        <div class="empty" id="emptyState">← 选择一个会话开始服务</div>
+    </div>
+</div>
+
+<script>
+let agentId = null;
+let ws = null;
+let currentSession = null;
+let sessions = {}; // {session_id: {messages: [], status: str}}
+
+async function login() {
+    const pw = document.getElementById('password').value;
+    try {
+        const r = await fetch('/api/agent/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw})});
+        if (!r.ok) { document.getElementById('loginError').style.display='block'; return; }
+        const d = await r.json();
+        agentId = d.agent_id;
+        document.getElementById('loginOverlay').style.display = 'none';
+        connectWS();
+    } catch(e) { document.getElementById('loginError').style.display='block'; }
+}
+
+function connectWS() {
+    ws = new WebSocket(`ws://${location.host}/ws/agent/${agentId}`);
+    ws.onopen = () => document.getElementById('headerInfo').textContent = `已连接 | 坐席: ${agentId}`;
+    ws.onclose = () => { document.getElementById('headerInfo').textContent = '已断开'; setTimeout(connectWS, 3000); };
+    ws.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        handleEvent(d);
+    };
+}
+
+function handleEvent(d) {
+    switch(d.type) {
+        case 'online':
+            document.getElementById('headerInfo').textContent = `已连接 | 坐席: ${agentId}`;
+            break;
+        case 'new_queue':
+            sessions[d.session_id] = {messages: [], status: 'waiting'};
+            renderQueue();
+            break;
+        case 'session_accepted':
+            sessions[d.session_id].status = 'serving';
+            currentSession = d.session_id;
+            renderQueue();
+            renderChat();
+            break;
+        case 'user_message':
+            if (!sessions[d.session_id]) sessions[d.session_id] = {messages: [], status: 'serving'};
+            sessions[d.session_id].messages.push({role:'user', text: d.text});
+            if (currentSession === d.session_id) renderChat();
+            break;
+        case 'ai_suggestion':
+            if (!sessions[d.session_id]) sessions[d.session_id] = {messages:[], status:'serving'};
+            sessions[d.session_id].messages.push({role:'suggestion', text: d.suggestion});
+            if (currentSession === d.session_id) renderChat();
+            break;
+        case 'session_ended':
+            if (sessions[d.session_id]) sessions[d.session_id].status = 'ended';
+            if (currentSession === d.session_id) {
+                addMsg('system', '会话已结束');
+            }
+            renderQueue();
+            break;
+    }
+}
+
+function renderQueue() {
+    const list = document.getElementById('queueList');
+    const items = Object.entries(sessions).filter(([_,s]) => s.status !== 'ended');
+    if (items.length === 0) {
+        list.innerHTML = '<div style="padding:40px 16px;text-align:center;color:var(--text-light);font-size:.85rem">暂无排队用户</div>';
+        return;
+    }
+    list.innerHTML = items.map(([sid, s]) => {
+        const isActive = currentSession === sid;
+        const cls = isActive ? 'queue-item active' : 'queue-item';
+        const badge = s.status === 'waiting' ? '<span class="badge">排队中</span>' : '<span class="badge badge-serving">服务中</span>';
+        const action = s.status === 'waiting'
+            ? `<button class="btn-accept" onclick="event.stopPropagation();acceptSession('${sid}')">接入</button>`
+            : `<button class="btn-end" onclick="event.stopPropagation();endSession('${sid}')">结束</button>`;
+        return `<div class="${cls}" onclick="selectSession('${sid}')">
+            <div class="name">用户 ${sid} ${badge}</div>
+            <div class="time">${s.messages.length} 条消息</div>
+            ${action}
+        </div>`;
+    }).join('');
+}
+
+function renderChat() {
+    const area = document.getElementById('chatArea');
+    const s = sessions[currentSession];
+    if (!s) return;
+    const msgs = s.messages;
+    area.innerHTML = `
+        <div class="chat-header">💬 用户 ${currentSession} ${s.status === 'serving' ? '(服务中)' : ''}</div>
+        <div class="messages" id="msgContainer">
+            ${msgs.map(m => {
+                if (m.role === 'user') return `<div class="msg msg-user">${esc(m.text)}</div>`;
+                if (m.role === 'agent') return `<div class="msg msg-agent">${esc(m.text)}</div>`;
+                if (m.role === 'suggestion') return `<div class="msg msg-suggestion"><div class="label">🤖 AI 建议</div><div class="text">${esc(m.text)}</div><button class="adopt" onclick="adoptSuggestion('${esc(m.text)}')">采纳</button></div>`;
+                if (m.role === 'system') return `<div class="msg-system">${esc(m.text)}</div>`;
+                return '';
+            }).join('')}
+        </div>
+        <div class="input-bar">
+            <input type="text" id="agentInput" placeholder="输入回复..." onkeydown="if(event.key==='Enter')sendMessage()">
+            <button onclick="sendMessage()">发送</button>
+        </div>`;
+    const c = document.getElementById('msgContainer');
+    if (c) c.scrollTop = c.scrollHeight;
+}
+
+function esc(s) { return s.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;').replace(/"/g,'&quot;'); }
+
+function selectSession(sid) { currentSession = sid; renderQueue(); renderChat(); }
+
+function acceptSession(sid) { ws.send(JSON.stringify({action:'accept', session_id: sid})); }
+function endSession(sid) { ws.send(JSON.stringify({action:'end', session_id: sid})); }
+
+function sendMessage() {
+    const input = document.getElementById('agentInput');
+    if (!input || !input.value.trim() || !currentSession) return;
+    const text = input.value.trim();
+    ws.send(JSON.stringify({action:'message', session_id: currentSession, text}));
+    sessions[currentSession].messages.push({role:'agent', text});
+    input.value = '';
+    renderChat();
+}
+
+function adoptSuggestion(text) {
+    ws.send(JSON.stringify({action:'message', session_id: currentSession, text}));
+    sessions[currentSession].messages.push({role:'agent', text});
+    renderChat();
+}
+
+function addMsg(role, text) {
+    if (!sessions[currentSession]) return;
+    sessions[currentSession].messages.push({role, text});
+    renderChat();
+}
+</script>
+</body>
+</html>

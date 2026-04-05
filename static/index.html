@@ -142,6 +142,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 
         <div style="margin-top:auto">
             <button class="btn btn-danger btn-block" onclick="clearChat()">🗑️ 清空对话</button>
+            <button class="btn btn-primary btn-block" style="margin-top:8px" onclick="transferToHuman()">👤 转人工客服</button>
         </div>
     </div>
 
@@ -343,6 +344,90 @@ async function send() {
         addMessage('bot', '❌ 请求失败: ' + e.message, [], 'rag');
     }
 }
+
+// === 转人工 ===
+let agentWs = null;
+let inHumanMode = false;
+
+async function transferToHuman() {
+    if (!sessionId) { toast('请先开始对话', 'error'); return; }
+    try {
+        const r = await fetch(`/api/human/transfer?session_id=${sessionId}`, {method:'POST'});
+        const d = await r.json();
+        if (d.status === 'already_serving') {
+            addMessage('bot', '您已在人工服务中', [], 'human_transfer');
+            return;
+        }
+        addMessage('bot', `⏳ 已进入人工排队，当前排队 ${d.queue_position} 人，请稍候...`, [], 'human_transfer');
+        inHumanMode = true;
+        // 连接用户 WebSocket
+        connectUserWS();
+    } catch(e) { toast('转接失败', 'error'); }
+}
+
+function connectUserWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    agentWs = new WebSocket(`${proto}//${location.host}/ws/user/${sessionId}`);
+    agentWs.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        if (d.type === 'waiting') {
+            addMessage('bot', `⏳ 排队中，前方还有 ${d.queue_position} 人...`, [], 'human_transfer');
+        } else if (d.type === 'agent_joined') {
+            addMessage('bot', '✅ 人工客服已接入，请描述您的问题。', [], 'human_transfer');
+            document.getElementById('userInput').placeholder = '输入消息（人工客服在线）';
+        } else if (d.type === 'agent_message') {
+            addMessage('bot', d.text, [], 'human_transfer');
+        } else if (d.type === 'agent_left') {
+            addMessage('bot', d.text, [], 'human_transfer');
+            inHumanMode = false;
+            document.getElementById('userInput').placeholder = '输入您的问题...';
+            if (agentWs) agentWs.close();
+        }
+    };
+    agentWs.onclose = () => { /* reconnect if needed */ };
+}
+
+// Override send for human mode
+const originalSend = send;
+send = async function() {
+    const input = document.getElementById('userInput');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    addMessage('user', text);
+    if (inHumanMode && agentWs && agentWs.readyState === WebSocket.OPEN) {
+        agentWs.send(JSON.stringify({text}));
+    } else {
+        // fallback to AI
+        addTyping();
+        try {
+            const resp = await fetch(API + '/api/chat/stream', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ question: text, history, session_id: sessionId })
+            });
+            // ... (same streaming logic)
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let fullText = '', sources = [], intent = 'rag', botEl = null;
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const lines = decoder.decode(value, {stream: true}).split('\n').filter(l => l.trim());
+                for (const line of lines) {
+                    try {
+                        const data = JSON.parse(line);
+                        if (data.type === 'meta') { removeTyping(); sources = data.sources||[]; intent = data.intent||'rag'; botEl = addMessage('bot', '', sources, intent); }
+                        else if (data.type === 'chunk') { fullText += data.text; if (botEl) botEl.querySelector('.msg-text').innerHTML = fullText.replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>').replace(/\n/g,'<br>').replace(/- (.+)/g,'• $1'); }
+                        else if (data.type === 'answer') { removeTyping(); fullText = data.text; addMessage('bot', fullText, data.sources||[], data.intent||'rag'); }
+                    } catch(e) {}
+                }
+            }
+            history.push({ role: 'user', content: text });
+            history.push({ role: 'assistant', content: fullText });
+        } catch(e) { removeTyping(); addMessage('bot', '❌ 请求失败', [], 'rag'); }
+    }
+};
 
 // Knowledge management
 async function loadKnowledge() {
