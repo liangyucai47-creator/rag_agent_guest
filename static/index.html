@@ -417,9 +417,13 @@ send = async function() {
                 for (const line of lines) {
                     try {
                         const data = JSON.parse(line);
-                        if (data.type === 'meta') { removeTyping(); sources = data.sources||[]; intent = data.intent||'rag'; botEl = addMessage('bot', '', sources, intent); }
+                        if (data.type === 'meta') { removeTyping(); sources = data.sources||[]; intent = data.intent||'rag'; botEl = addMessage('bot', '', sources, intent);
+                            if (intent === 'human_transfer') transferToHuman();
+                        }
                         else if (data.type === 'chunk') { fullText += data.text; if (botEl) botEl.querySelector('.msg-text').innerHTML = fullText.replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>').replace(/\n/g,'<br>').replace(/- (.+)/g,'• $1'); }
-                        else if (data.type === 'answer') { removeTyping(); fullText = data.text; addMessage('bot', fullText, data.sources||[], data.intent||'rag'); }
+                        else if (data.type === 'answer') { removeTyping(); fullText = data.text; addMessage('bot', fullText, data.sources||[], data.intent||'rag');
+                            if (data.intent === 'human_transfer') transferToHuman();
+                        }
                     } catch(e) {}
                 }
             }

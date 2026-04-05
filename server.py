@@ -881,8 +881,6 @@ async def ws_agent(ws: WebSocket, agent_id: str):
                     # 记录到会话历史
                     if session_id:
                         session_mgr.append(session_id, "assistant", text)
-                    # AI旁听：生成建议（异步，不阻塞）
-                    await asyncio.create_task(_ai_suggest(agent_id, session_id, text))
                 else:
                     await ws.send_json({"type": "error", "text": "用户不在线"})
 
@@ -911,15 +909,31 @@ async def ws_agent(ws: WebSocket, agent_id: str):
         print(f"[坐席] {agent_id} 下线")
 
 
-async def _ai_suggest(agent_id: str, session_id: str, user_msg: str):
-    """AI旁听：给坐席推荐回复"""
+async def _ai_suggest(agent_id: str, session_id: str):
+    """AI旁听：基于完整对话历史给坐席推荐回复"""
     try:
         history = session_mgr.get_history(session_id) if session_id else []
-        candidates = kb.search(user_msg, top_k=3, expand=True)
-        if not candidates:
+        if not history:
             return
-        context = "\n".join([f"- {r['text'][:100]}" for r in candidates[:3]])
-        prompt = f"用户问题：{user_msg}\n\n参考信息：\n{context}\n\n请给客服一个简洁的回复建议（50字以内）："
+        # 取最近几轮对话作为上下文
+        recent = history[-10:]
+        user_msg = recent[-1]["content"] if recent else ""
+        context_text = "\n".join([f"{'用户' if m['role']=='user' else '客服'}: {m['content']}" for m in recent])
+
+        # 从知识库检索相关信息
+        candidates = kb.search(user_msg, top_k=3, expand=True)
+        kb_context = "\n".join([f"- {r['text'][:100]}" for r in candidates[:3]]) if candidates else "无"
+
+        prompt = f"""你是一个客服助手，帮助坐席生成回复建议。请基于对话上下文和知识库信息，给一个简洁专业的回复（50字以内）。
+
+对话上下文：
+{context_text}
+
+知识库参考：
+{kb_context}
+
+回复建议："""
+
         resp = rag._llm.chat.completions.create(
             model=LLM_MODEL, temperature=0.3, max_tokens=100,
             messages=[{"role": "user", "content": prompt}]
@@ -999,6 +1013,8 @@ async def ws_user(ws: WebSocket, session_id: str):
                     })
                     # 记录用户消息
                     session_mgr.append(session_id, "user", msg.get("text", ""))
+                    # AI旁听：用户发消息后立即生成建议
+                    await asyncio.create_task(_ai_suggest(agent_id, session_id))
     except WebSocketDisconnect:
         pass
     finally:
