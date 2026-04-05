@@ -94,7 +94,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 
 <div class="header">
     <h1>🎮 速游智能客服</h1>
-    <div class="status"><span class="dot"></span> RAG v2.0</div>
+    <div class="status"><span class="dot"></span> RAG v5.0</div>
 </div>
 
 <div class="main">
@@ -158,6 +158,44 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 <script>
 const API = '';
 let history = [];
+let sessionId = localStorage.getItem('rag_session_id') || null;
+
+// 初始化会话
+async function initSession() {
+    if (sessionId) {
+        // 恢复历史
+        try {
+            const data = await apiGet(`/api/session/${sessionId}/history`);
+            if (data.history && data.history.length > 0) {
+                // 渲染历史消息
+                data.history.forEach(msg => {
+                    if (msg.role === 'user' || msg.role === 'assistant') {
+                        const div = document.createElement('div');
+                        div.className = `msg msg-${msg.role === 'user' ? 'user' : 'bot'}`;
+                        div.querySelector?.('.msg-text')?.innerHTML;
+                        const textDiv = document.createElement('div');
+                        textDiv.className = 'msg-text';
+                        textDiv.innerHTML = msg.content.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>').replace(/- (.+)/g, '• $1');
+                        div.appendChild(textDiv);
+                        document.getElementById('messages').querySelector('.welcome')?.remove();
+                        document.getElementById('messages').appendChild(div);
+                    }
+                });
+                history = data.history;
+            }
+        } catch(e) { /* 历史加载失败不影响使用 */ }
+        return;
+    }
+    // 创建新会话
+    try {
+        const data = await apiPost('/api/session/new', null);
+        sessionId = data.session_id;
+        localStorage.setItem('rag_session_id', sessionId);
+    } catch(e) {}
+}
+
+// 页面加载时初始化
+initSession();
 
 // API calls
 async function apiPost(path, body) {
@@ -241,7 +279,7 @@ async function send() {
         const resp = await fetch(API + '/api/chat/stream', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ question, history })
+            body: JSON.stringify({ question, history, session_id: sessionId })
         });
 
         const reader = resp.body.getReader();
@@ -348,6 +386,7 @@ async function refreshStats() {
 
 function clearChat() {
     history = [];
+    if (sessionId) apiPost(`/api/session/${sessionId}/clear`, null).catch(()=>{});
     document.getElementById('messages').innerHTML = '<div class="welcome"><h2>👋 有什么可以帮您的？</h2><p>试试问我：加速失败怎么办 / 支持哪些游戏</p></div>';
 }
 

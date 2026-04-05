@@ -547,11 +547,79 @@ rag = RAGEngine(kb, cache)
 class ChatRequest(BaseModel):
     question: str
     history: Optional[List[Dict]] = None
+    session_id: Optional[str] = None  # 会话ID
+
+
+# ============================================================
+# 会话管理（Redis 存储对话历史）
+# ============================================================
+
+class SessionManager:
+    """管理用户会话和多轮对话历史"""
+
+    SESSION_PREFIX = "rag:session:"
+    SESSION_TTL = 86400 * 7  # 7天过期
+    MAX_TURNS = 20  # 最多保留20轮
+
+    def __init__(self, redis_client=None):
+        self._redis = redis_client
+
+    @property
+    def enabled(self):
+        return self._redis is not None
+
+    def get_history(self, session_id: str) -> List[Dict]:
+        if not self._redis:
+            return []
+        try:
+            data = self._redis.get(f"{self.SESSION_PREFIX}{session_id}")
+            return json.loads(data) if data else []
+        except Exception:
+            return []
+
+    def append(self, session_id: str, role: str, content: str):
+        if not self._redis:
+            return
+        try:
+            history = self.get_history(session_id)
+            history.append({"role": role, "content": content})
+            # 只保留最近 MAX_TURNS 轮（每轮 = user + assistant）
+            history = history[-(self.MAX_TURNS * 2):]
+            self._redis.setex(
+                f"{self.SESSION_PREFIX}{session_id}",
+                self.SESSION_TTL,
+                json.dumps(history, ensure_ascii=False)
+            )
+        except Exception:
+            pass
+
+    def clear(self, session_id: str):
+        if not self._redis:
+            return
+        try:
+            self._redis.delete(f"{self.SESSION_PREFIX}{session_id}")
+        except Exception:
+            pass
+
+    def stats(self) -> Dict:
+        if not self._redis:
+            return {"enabled": False}
+        try:
+            keys = self._redis.keys(f"{self.SESSION_PREFIX}*")
+            return {"enabled": True, "active_sessions": len(keys), "ttl_days": 7}
+        except Exception:
+            return {"enabled": False}
+
+
+# 全局实例
+session_mgr = SessionManager()
 
 
 @app.on_event("startup")
 def startup():
     cache.connect()
+    if cache.enabled:
+        session_mgr._redis = cache._redis
     if KNOWLEDGE_DIR.exists():
         result = kb.load_directory(str(KNOWLEDGE_DIR))
         if "error" not in result:
@@ -572,6 +640,7 @@ def health():
         "redis": cache.enabled,
         "cache_stats": cache.stats(),
         "knowledge": kb.stats(),
+        "sessions": session_mgr.stats(),
     }
 
 
@@ -580,7 +649,16 @@ def health():
 def chat(req: ChatRequest, request: Request):
     if not req.question.strip():
         raise HTTPException(400, "问题不能为空")
-    return rag.chat(req.question, req.history)
+    # 加载会话历史
+    history = req.history or []
+    if req.session_id:
+        history = session_mgr.get_history(req.session_id)
+    result = rag.chat(req.question, history)
+    # 保存对话
+    if req.session_id:
+        session_mgr.append(req.session_id, "user", req.question)
+        session_mgr.append(req.session_id, "assistant", result.get("answer", ""))
+    return result
 
 
 @app.post("/api/chat/stream")
@@ -588,8 +666,37 @@ def chat(req: ChatRequest, request: Request):
 async def chat_stream(req: ChatRequest, request: Request):
     if not req.question.strip():
         raise HTTPException(400, "问题不能为空")
+    # 加载会话历史
+    history = req.history or []
+    if req.session_id:
+        history = session_mgr.get_history(req.session_id)
+
+    # 记录用户消息
+    if req.session_id:
+        session_mgr.append(req.session_id, "user", req.question)
+
+    # 收集完整回答用于存储
+    full_answer = []
+    sid = req.session_id
+
+    def stream_with_save():
+        for chunk in rag.chat_stream(req.question, history):
+            yield chunk
+            # 收集回答
+            try:
+                data = json.loads(chunk.strip())
+                if data.get("type") == "chunk":
+                    full_answer.append(data.get("text", ""))
+                elif data.get("type") == "answer":
+                    full_answer.append(data.get("text", ""))
+            except Exception:
+                pass
+        # 保存 AI 回答
+        if sid:
+            session_mgr.append(sid, "assistant", "".join(full_answer))
+
     return StreamingResponse(
-        rag.chat_stream(req.question, req.history),
+        stream_with_save(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
@@ -671,6 +778,27 @@ def cache_stats():
 def cache_clear():
     count = cache.clear()
     return {"status": "ok", "cleared": count}
+
+
+# --- 会话管理 ---
+
+@app.post("/api/session/new")
+def new_session():
+    """创建新会话"""
+    import uuid
+    session_id = str(uuid.uuid4())[:8]
+    return {"session_id": session_id}
+
+@app.get("/api/session/{session_id}/history")
+def get_history(session_id: str):
+    """获取会话历史"""
+    return {"session_id": session_id, "history": session_mgr.get_history(session_id)}
+
+@app.post("/api/session/{session_id}/clear")
+def clear_session(session_id: str):
+    """清空会话历史"""
+    session_mgr.clear(session_id)
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
