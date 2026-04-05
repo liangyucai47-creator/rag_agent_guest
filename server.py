@@ -825,8 +825,15 @@ def agent_page():
 
 
 @app.post("/api/agent/login")
-def agent_login(password: str):
+async def agent_login(request: Request, password: str = None):
     """坐席登录验证"""
+    # 兼容 body 和 query 两种方式
+    if password is None:
+        try:
+            body = await request.json()
+            password = body.get("password", "")
+        except Exception:
+            raise HTTPException(400, "请提供密码")
     if password == AGENT_PASSWORD:
         import uuid
         agent_id = str(uuid.uuid4())[:8]
