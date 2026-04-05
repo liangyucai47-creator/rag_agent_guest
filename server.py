@@ -356,6 +356,78 @@ class RAGEngine:
         self.cache = cache
         self._llm = OpenAI(api_key=LLM_API_KEY, base_url=LLM_API_BASE)
 
+    def _contextual_query(self, question: str, history: List[Dict] = None) -> str:
+        """上下文感知检索：结合对话历史重构查询（指代消解）"""
+        if not history or len(history) < 2:
+            return question
+
+        # 只取最近几轮
+        recent = history[-6:]
+        history_text = "\n".join([f"{'用户' if m['role']=='user' else '客服'}: {m['content']}" for m in recent])
+
+        prompt = f"""根据对话历史，将用户的最新问题改写为一个独立完整的问题。
+保持原意，补充历史中提到的具体信息（如游戏名、平台等）。
+只输出改写后的问题，不要解释。
+
+对话历史：
+{history_text}
+
+最新问题：{question}
+
+改写后的问题："""
+
+        try:
+            resp = self._llm.chat.completions.create(
+                model=LLM_MODEL, temperature=0.0, max_tokens=100,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            rewritten = resp.choices[0].message.content.strip()
+            if rewritten and rewritten != question:
+                print(f"[上下文感知] '{question}' → '{rewritten}'")
+                return rewritten
+        except Exception as e:
+            print(f"[上下文感知] 降级: {e}")
+        return question
+
+    def _self_evaluate(self, question: str, answer: str, sources: List[str]) -> Tuple[str, float]:
+        """回答自检：评估回答是否基于文档、是否幻觉"""
+        prompt = f"""评估这个AI回答的质量，只输出JSON。
+
+用户问题：{question}
+参考来源：{', '.join(sources) if sources else '无'}
+AI回答：{answer[:500]}
+
+评分标准：
+- relevance: 回答是否切题 (0-1)
+- grounded: 回答是否基于参考来源 (0-1)
+- hallucination: 是否包含编造内容 (0-1, 0=无幻觉)
+
+只输出JSON: {{"relevance": 0.8, "grounded": 0.9, "hallucination": 0.1}}"""
+
+        try:
+            resp = self._llm.chat.completions.create(
+                model=LLM_MODEL, temperature=0.0, max_tokens=100,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = resp.choices[0].message.content.strip()
+            # 提取JSON
+            match = re.search(r'\{[^}]+\}', text)
+            if match:
+                scores = json.loads(match.group())
+                relevance = scores.get("relevance", 0.5)
+                grounded = scores.get("grounded", 0.5)
+                hallucination = scores.get("hallucination", 0.5)
+                score = (relevance + grounded - hallucination) / 2
+                print(f"[自检] relevance={relevance:.1f} grounded={grounded:.1f} hallucination={hallucination:.1f} → 总分={score:.2f}")
+
+                if score < 0.4 or hallucination > 0.6:
+                    warning = "\n\n⚠️ 以上回答可能不够准确，建议联系人工客服确认。"
+                    return answer + warning, score
+                return answer, score
+        except Exception as e:
+            print(f"[自检] 降级: {e}")
+        return answer, 0.5
+
     def _rerank(self, query: str, results: List[Dict], top_k: int = 5) -> List[Dict]:
         """用 LLM 对检索结果重排序（交叉编码器原理：逐对判断相关性）"""
         if len(results) <= top_k:
@@ -437,15 +509,18 @@ class RAGEngine:
             self.cache.set(question, result)
             return result
 
-        # 2. 检索（查询扩展 + Reranker）
-        candidates = self.kb.search(question, top_k=15, expand=True)
-        results = self._rerank(question, candidates, top_k=5)
+        # 2. 上下文感知：结合历史重构查询
+        retrieval_query = self._contextual_query(question, history)
+
+        # 3. 检索（查询扩展 + Reranker）
+        candidates = self.kb.search(retrieval_query, top_k=15, expand=True)
+        results = self._rerank(retrieval_query, candidates, top_k=5)
         if not results:
             result = {"answer": "抱歉，知识库中暂未找到相关信息。建议联系人工客服。", "intent": "rag", "sources": [], "confidence": 0.0}
             self.cache.set(question, result)
             return result
 
-        # 3. 构建上下文
+        # 4. 构建上下文
         context_parts, sources = [], []
         for i, r in enumerate(results):
             if r["source"] and r["source"] not in sources:
@@ -453,7 +528,7 @@ class RAGEngine:
             context_parts.append(f"[来源{i+1}: {r['source']}]\n{r['text']}")
         context = "\n\n".join(context_parts)
 
-        # 4. LLM 生成
+        # 5. LLM 生成
         try:
             messages = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}]
             if history:
@@ -463,12 +538,17 @@ class RAGEngine:
             resp = self._llm.chat.completions.create(
                 model=LLM_MODEL, temperature=0.3, max_tokens=2048, messages=messages
             )
-            result = {"answer": resp.choices[0].message.content, "intent": "rag", "sources": sources, "confidence": confidence}
+            answer = resp.choices[0].message.content
+
+            # 6. 回答自检
+            answer, eval_score = self._self_evaluate(question, answer, sources)
+
+            result = {"answer": answer, "intent": "rag", "sources": sources, "confidence": eval_score}
         except Exception as e:
             fallback = "基于知识库检索：\n\n" + "\n\n".join([f"**{r['source']}**：{r['text'][:150]}..." for r in results[:3]])
             result = {"answer": fallback, "intent": "rag", "sources": sources, "confidence": 0.3, "error": str(e)}
 
-        # 5. 写缓存
+        # 7. 写缓存
         self.cache.set(question, result)
         return result
 
@@ -486,7 +566,7 @@ class RAGEngine:
             yield json.dumps({"type": "answer", "text": quick, "intent": intent, "sources": []}, ensure_ascii=False) + "\n"
             return
 
-        results = self.kb.search(question, top_k=15, expand=True)
+        results = self.kb.search(self._contextual_query(question, history), top_k=15, expand=True)
         results = self._rerank(question, results, top_k=5)
         if not results:
             yield json.dumps({"type": "answer", "text": "抱歉，知识库中暂未找到相关信息。", "intent": "rag", "sources": []}, ensure_ascii=False) + "\n"
