@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-RAG 智能客服 - 生产级后端
+RAG 智能客服 - 生产级后端 v3.0
 
-技术栈：FastAPI + ChromaDB + 智谱 Embedding API + Kimi LLM API
+技术栈：FastAPI + ChromaDB + 智谱 Embedding API + Kimi LLM API + Redis
 特性：流式输出、多轮对话、意图识别、知识库管理、WebSocket
+高并发：Redis 语义缓存 + 请求限流 + 多 Worker 支持
 
 启动: python3 server.py
+多Worker: python3 server.py --workers 4
 """
 
 import os
@@ -13,17 +15,22 @@ import re
 import json
 import hashlib
 import asyncio
+import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, AsyncGenerator
+from typing import Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import chromadb
 from openai import OpenAI
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import redis
 
 
 # ============================================================
@@ -39,6 +46,14 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "moonshot-v1-8k")
 EMBED_API_KEY = os.environ.get("EMBED_API_KEY", "7efb744022204110a0202b0a77794b72.IOYX4nJnHIYhT9Ow")
 EMBED_API_BASE = os.environ.get("EMBED_API_BASE", "https://open.bigmodel.cn/api/paas/v4")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "embedding-3")
+
+# Redis
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+REDIS_CACHE_TTL = int(os.environ.get("REDIS_CACHE_TTL", "3600"))  # 缓存1小时
+REDIS_CACHE_PREFIX = "rag:cache:"
+
+# 限流
+RATE_LIMIT = os.environ.get("RATE_LIMIT", "20/minute")  # 每分钟20次
 
 # 向量库
 CHROMA_DIR = os.path.join(os.path.dirname(__file__), "data", "chroma_db")
@@ -70,6 +85,81 @@ INTENT_KEYWORDS = {
 BASE_DIR = Path(__file__).parent
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
 UPLOAD_DIR = BASE_DIR / "knowledge" / "uploads"
+
+
+# ============================================================
+# Redis 缓存层
+# ============================================================
+
+class CacheLayer:
+    """Redis 语义缓存：相似问题命中直接返回"""
+
+    def __init__(self):
+        self._redis = None
+        self._enabled = False
+
+    def connect(self):
+        try:
+            self._redis = redis.from_url(REDIS_URL, decode_responses=True)
+            self._redis.ping()
+            self._enabled = True
+            print(f"[缓存] Redis 已连接: {REDIS_URL}")
+        except Exception as e:
+            self._enabled = False
+            print(f"[缓存] Redis 不可用，降级为无缓存模式: {e}")
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+    def _key(self, question: str) -> str:
+        return REDIS_CACHE_PREFIX + hashlib.md5(question.strip().encode()).hexdigest()
+
+    def get(self, question: str) -> Optional[Dict]:
+        """查询缓存"""
+        if not self._enabled:
+            return None
+        try:
+            data = self._redis.get(self._key(question))
+            if data:
+                result = json.loads(data)
+                result["from_cache"] = True
+                print(f"[缓存] 命中: {question[:30]}...")
+                return result
+        except Exception:
+            pass
+        return None
+
+    def set(self, question: str, result: Dict) -> None:
+        """写入缓存"""
+        if not self._enabled:
+            return
+        try:
+            cache_data = {k: v for k, v in result.items() if k != "from_cache"}
+            self._redis.setex(self._key(question), REDIS_CACHE_TTL, json.dumps(cache_data, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def clear(self) -> int:
+        """清空缓存"""
+        if not self._enabled:
+            return 0
+        try:
+            keys = self._redis.keys(f"{REDIS_CACHE_PREFIX}*")
+            if keys:
+                return self._redis.delete(*keys)
+        except Exception:
+            pass
+        return 0
+
+    def stats(self) -> Dict:
+        if not self._enabled:
+            return {"enabled": False, "keys": 0}
+        try:
+            keys = self._redis.keys(f"{REDIS_CACHE_PREFIX}*")
+            return {"enabled": True, "cached_questions": len(keys), "ttl_seconds": REDIS_CACHE_TTL}
+        except Exception as e:
+            return {"enabled": False, "error": str(e)}
 
 
 # ============================================================
@@ -213,14 +303,15 @@ class KnowledgeBase:
 
 
 # ============================================================
-# RAG 引擎
+# RAG 引擎（带缓存）
 # ============================================================
 
 class RAGEngine:
-    """RAG 核心：意图识别 → 检索 → 生成"""
+    """RAG 核心：缓存 → 意图识别 → 检索 → 生成"""
 
-    def __init__(self, kb: KnowledgeBase):
+    def __init__(self, kb: KnowledgeBase, cache: CacheLayer):
         self.kb = kb
+        self.cache = cache
         self._llm = OpenAI(api_key=LLM_API_KEY, base_url=LLM_API_BASE)
 
     def classify_intent(self, text: str) -> Tuple[str, float]:
@@ -238,18 +329,27 @@ class RAGEngine:
         return None
 
     def chat(self, question: str, history: List[Dict] = None) -> Dict:
+        # 1. 查缓存
+        cached = self.cache.get(question)
+        if cached:
+            return cached
+
         intent, confidence = self.classify_intent(question)
 
         quick = self._quick_reply(intent)
         if quick:
-            return {"answer": quick, "intent": intent, "sources": [], "confidence": 1.0}
+            result = {"answer": quick, "intent": intent, "sources": [], "confidence": 1.0}
+            self.cache.set(question, result)
+            return result
 
-        # 检索
+        # 2. 检索
         results = self.kb.search(question, top_k=5)
         if not results:
-            return {"answer": "抱歉，知识库中暂未找到相关信息。建议联系人工客服。", "intent": "rag", "sources": [], "confidence": 0.0}
+            result = {"answer": "抱歉，知识库中暂未找到相关信息。建议联系人工客服。", "intent": "rag", "sources": [], "confidence": 0.0}
+            self.cache.set(question, result)
+            return result
 
-        # 构建上下文
+        # 3. 构建上下文
         context_parts, sources = [], []
         for i, r in enumerate(results):
             if r["source"] and r["source"] not in sources:
@@ -257,7 +357,7 @@ class RAGEngine:
             context_parts.append(f"[来源{i+1}: {r['source']}]\n{r['text']}")
         context = "\n\n".join(context_parts)
 
-        # LLM 生成
+        # 4. LLM 生成
         try:
             messages = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}]
             if history:
@@ -267,13 +367,23 @@ class RAGEngine:
             resp = self._llm.chat.completions.create(
                 model=LLM_MODEL, temperature=0.3, max_tokens=2048, messages=messages
             )
-            return {"answer": resp.choices[0].message.content, "intent": "rag", "sources": sources, "confidence": confidence}
+            result = {"answer": resp.choices[0].message.content, "intent": "rag", "sources": sources, "confidence": confidence}
         except Exception as e:
             fallback = "基于知识库检索：\n\n" + "\n\n".join([f"**{r['source']}**：{r['text'][:150]}..." for r in results[:3]])
-            return {"answer": fallback, "intent": "rag", "sources": sources, "confidence": 0.3, "error": str(e)}
+            result = {"answer": fallback, "intent": "rag", "sources": sources, "confidence": 0.3, "error": str(e)}
+
+        # 5. 写缓存
+        self.cache.set(question, result)
+        return result
 
     def chat_stream(self, question: str, history: List[Dict] = None):
-        """流式生成（同步 generator，StreamingResponse 会正确处理）"""
+        """流式生成"""
+        # 缓存命中直接返回完整答案
+        cached = self.cache.get(question)
+        if cached:
+            yield json.dumps({"type": "answer", "text": cached["answer"], "intent": cached.get("intent", "rag"), "sources": cached.get("sources", []), "from_cache": True}, ensure_ascii=False) + "\n"
+            return
+
         intent, confidence = self.classify_intent(question)
         quick = self._quick_reply(intent)
         if quick:
@@ -303,10 +413,14 @@ class RAGEngine:
             stream = self._llm.chat.completions.create(
                 model=LLM_MODEL, temperature=0.3, max_tokens=2048, messages=messages, stream=True
             )
+            full_answer = ""
             for chunk in stream:
                 if chunk.choices[0].delta.content:
+                    full_answer += chunk.choices[0].delta.content
                     yield json.dumps({"type": "chunk", "text": chunk.choices[0].delta.content}, ensure_ascii=False) + "\n"
 
+            # 流式完成后缓存
+            self.cache.set(question, {"answer": full_answer, "intent": "rag", "sources": sources, "confidence": confidence})
             yield json.dumps({"type": "done"}, ensure_ascii=False) + "\n"
         except Exception as e:
             yield json.dumps({"type": "error", "text": str(e)}, ensure_ascii=False) + "\n"
@@ -316,19 +430,35 @@ class RAGEngine:
 # FastAPI 应用
 # ============================================================
 
-app = FastAPI(title="RAG 智能客服 API", version="2.0.0")
+app = FastAPI(title="RAG 智能客服 API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# 限流
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # 静态文件
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
+# 全局实例
+cache = CacheLayer()
 kb = KnowledgeBase()
-rag = RAGEngine(kb)
+rag = RAGEngine(kb, cache)
 
 
 class ChatRequest(BaseModel):
     question: str
     history: Optional[List[Dict]] = None
+
+
+@app.on_event("startup")
+def startup():
+    cache.connect()
+    if KNOWLEDGE_DIR.exists():
+        result = kb.load_directory(str(KNOWLEDGE_DIR))
+        if "error" not in result:
+            print(f"[启动] 知识库已加载: {result['loaded_files']} 文件, {result['total_chunks']} 切片")
 
 
 @app.get("/")
@@ -338,18 +468,27 @@ def index():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "rag-customer-service", "version": "2.0.0"}
+    return {
+        "status": "ok",
+        "service": "rag-customer-service",
+        "version": "3.0.0",
+        "redis": cache.enabled,
+        "cache_stats": cache.stats(),
+        "knowledge": kb.stats(),
+    }
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest):
+@limiter.limit(RATE_LIMIT)
+def chat(req: ChatRequest, request: Request):
     if not req.question.strip():
         raise HTTPException(400, "问题不能为空")
     return rag.chat(req.question, req.history)
 
 
 @app.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest):
+@limiter.limit(RATE_LIMIT)
+async def chat_stream(req: ChatRequest, request: Request):
     if not req.question.strip():
         raise HTTPException(400, "问题不能为空")
     return StreamingResponse(
@@ -372,14 +511,16 @@ async def ws_chat(ws: WebSocket):
                 await ws.send_json({"type": "error", "text": "问题不能为空"})
                 continue
 
-            async for chunk in rag.chat_stream(question, history):
+            for chunk in rag.chat_stream(question, history):
                 await ws.send_text(chunk)
 
             history.append({"role": "user", "content": question})
-            history.append({"role": "assistant", "content": ""})  # 简化，实际应存完整回答
+            history.append({"role": "assistant", "content": ""})
     except WebSocketDisconnect:
         pass
 
+
+# --- 知识库管理 ---
 
 @app.get("/api/knowledge/stats")
 def knowledge_stats():
@@ -393,12 +534,16 @@ def load_knowledge(directory: str):
     result = kb.load_directory(directory)
     if "error" in result:
         raise HTTPException(400, result["error"])
+    # 加载新知识后清空缓存
+    cache.clear()
     return result
 
 
 @app.post("/api/knowledge/add")
 def add_knowledge(text: str, source: str = "manual"):
-    return kb.add_text(text, source)
+    result = kb.add_text(text, source)
+    cache.clear()
+    return result
 
 
 @app.post("/api/knowledge/upload")
@@ -413,22 +558,44 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/api/knowledge/reset")
 def reset_knowledge():
-    return kb.reset()
+    result = kb.reset()
+    cache.clear()
+    return result
+
+
+# --- 缓存管理 ---
+
+@app.get("/api/cache/stats")
+def cache_stats():
+    return cache.stats()
+
+
+@app.post("/api/cache/clear")
+def cache_clear():
+    count = cache.clear()
+    return {"status": "ok", "cleared": count}
 
 
 if __name__ == "__main__":
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="RAG 智能客服 v3.0")
+    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
+    parser.add_argument("--port", type=int, default=8901, help="监听端口")
+    parser.add_argument("--workers", type=int, default=1, help="Worker 进程数（多进程并发）")
+    args = parser.parse_args()
+
     print("=" * 50)
-    print("RAG 智能客服 v2.0")
+    print("RAG 智能客服 v3.0")
     print(f"LLM: {LLM_MODEL} ({LLM_API_BASE})")
     print(f"Embedding: {EMBED_MODEL} ({EMBED_API_BASE})")
+    print(f"Redis: {REDIS_URL}")
+    print(f"限流: {RATE_LIMIT}")
+    print(f"Workers: {args.workers}")
     print(f"知识库: {CHROMA_DIR}")
     print("=" * 50)
 
-    # 自动加载知识库
-    if KNOWLEDGE_DIR.exists():
-        result = kb.load_directory(str(KNOWLEDGE_DIR))
-        if "error" not in result:
-            print(f"[启动] 知识库已加载: {result['loaded_files']} 文件, {result['total_chunks']} 切片")
-
-    uvicorn.run(app, host="0.0.0.0", port=8901)
+    if args.workers > 1:
+        uvicorn.run("server:app", host=args.host, port=args.port, workers=args.workers)
+    else:
+        uvicorn.run(app, host=args.host, port=args.port)

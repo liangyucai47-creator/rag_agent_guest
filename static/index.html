@@ -277,7 +277,13 @@ async function send() {
                         fullText = data.text;
                         sources = data.sources || [];
                         intent = data.intent || 'rag';
-                        addMessage('bot', fullText, sources, intent);
+                        if (data.from_cache) {
+                            botEl = addMessage('bot', '', sources, intent);
+                            botEl.querySelector('.msg-meta').innerHTML += ' <span class="msg-source">⚡ 缓存命中</span>';
+                            botEl.querySelector('.msg-text').innerHTML = fullText.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>').replace(/- (.+)/g, '• $1');
+                        } else {
+                            addMessage('bot', fullText, sources, intent);
+                        }
                     } else if (data.type === 'error') {
                         removeTyping();
                         addMessage('bot', '❌ 出错了：' + data.text, [], 'rag');
