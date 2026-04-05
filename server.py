@@ -285,13 +285,54 @@ class KnowledgeBase:
         self.collection.add(documents=chunks, embeddings=embeddings, metadatas=[{"source": source}]*len(chunks), ids=ids)
         return {"chunks": len(chunks)}
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict]:
-        q_emb = self._embed.embed_one(query)
-        results = self.collection.query(query_embeddings=[q_emb], n_results=top_k)
+    def expand_query(self, query: str) -> str:
+        """查询扩展：在同义词表中查找，补充关键词（不替换原问题）"""
+        SYNONYMS = {
+            "加速": ["加速", "代理", "节点", "专线"],
+            "延迟": ["延迟", "卡顿", "ping", "lag", "网络慢"],
+            "失败": ["失败", "连不上", "无法连接", "错误", "报错"],
+            "退款": ["退款", "退订", "取消订阅", "退费"],
+            "充值": ["充值", "续费", "购买", "会员", "套餐"],
+            "游戏": ["游戏", "game", "steam"],
+            "打不开": ["打不开", "无法启动", "启动失败", "闪退", "黑屏"],
+            "怎么": ["怎么", "如何", "怎样"],
+            "为什么": ["为什么", "原因", "怎么回事"],
+            "卡": ["卡", "延迟高", "丢包", "不稳定"],
+            "下载": ["下载", "安装", "更新"],
+            "加速器": ["加速器", "加速软件", "网游加速"],
+            "节点": ["节点", "服务器", "线路", "区服"],
+        }
+        extra = set()
+        for word, syns in SYNONYMS.items():
+            if word in query:
+                extra.update(syns)
+        if extra:
+            extra.discard(query)  # 去掉可能重复的原词
+            return query + " " + " ".join(list(extra)[:8])
+        return query
+
+    def search(self, query: str, top_k: int = 5, expand: bool = True) -> List[Dict]:
+        """检索：支持查询扩展，扩大候选集后返回"""
+        # 查询扩展
+        expanded = self.expand_query(query) if expand else query
+        retrieve_k = top_k * 3 if expand else top_k  # 扩展后多取候选
+
+        q_emb = self._embed.embed_one(expanded)
+        results = self.collection.query(query_embeddings=[q_emb], n_results=min(retrieve_k, self.collection.count() or 1))
         docs = results.get("documents", [[]])[0]
         metas = results.get("metadatas", [[]])[0]
         dists = results.get("distances", [[]])[0]
-        return [{"text": d, "source": m.get("source", ""), "distance": dist} for d, m, dist in zip(docs, metas, dists)]
+
+        items = [{"text": d, "source": m.get("source", ""), "distance": dist} for d, m, dist in zip(docs, metas, dists)]
+        # 去重（同一文本可能被多次命中）
+        seen = set()
+        unique = []
+        for item in items:
+            key = item["text"][:50]
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        return unique[:retrieve_k]  # 返回候选集，交给 Reranker 精筛
 
     def stats(self) -> Dict:
         return {"total_chunks": self.collection.count(), "collection": CHROMA_COLLECTION}
@@ -313,6 +354,54 @@ class RAGEngine:
         self.kb = kb
         self.cache = cache
         self._llm = OpenAI(api_key=LLM_API_KEY, base_url=LLM_API_BASE)
+
+    def _rerank(self, query: str, results: List[Dict], top_k: int = 5) -> List[Dict]:
+        """用 LLM 对检索结果重排序（交叉编码器原理：逐对判断相关性）"""
+        if len(results) <= top_k:
+            return results[:top_k]
+
+        # 构建打分 prompt
+        docs_text = "\n".join([f"[{i}] {r['text']}" for i, r in enumerate(results)])
+        prompt = f"""判断以下文档与问题的相关性，只返回最相关的{top_k}个文档编号，用逗号分隔。
+
+问题：{query}
+
+文档：
+{docs_text}
+
+最相关的{top_k}个编号："""
+
+        try:
+            resp = self._llm.chat.completions.create(
+                model=LLM_MODEL, temperature=0.0, max_tokens=50,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            answer = resp.choices[0].message.content.strip()
+            # 解析编号
+            indices = []
+            for part in re.split(r'[,，\s]+', answer):
+                part = part.strip()
+                match = re.search(r'\d+', part)
+                if match:
+                    idx = int(match.group())
+                    if 0 <= idx < len(results):
+                        indices.append(idx)
+            # 去重保序
+            seen = set()
+            ranked = []
+            for idx in indices:
+                if idx not in seen:
+                    seen.add(idx)
+                    ranked.append(results[idx])
+            # 补充未被选中的（保底）
+            for r in results:
+                if r not in ranked:
+                    ranked.append(r)
+            print(f"[Reranker] {len(results)} → {len(ranked[:top_k])} (prompt: {answer[:50]})")
+            return ranked[:top_k]
+        except Exception as e:
+            print(f"[Reranker] 降级: {e}")
+            return results[:top_k]
 
     def classify_intent(self, text: str) -> Tuple[str, float]:
         text_lower = text.lower()
@@ -342,8 +431,9 @@ class RAGEngine:
             self.cache.set(question, result)
             return result
 
-        # 2. 检索
-        results = self.kb.search(question, top_k=5)
+        # 2. 检索（查询扩展 + Reranker）
+        candidates = self.kb.search(question, top_k=15, expand=True)
+        results = self._rerank(question, candidates, top_k=5)
         if not results:
             result = {"answer": "抱歉，知识库中暂未找到相关信息。建议联系人工客服。", "intent": "rag", "sources": [], "confidence": 0.0}
             self.cache.set(question, result)
@@ -390,7 +480,8 @@ class RAGEngine:
             yield json.dumps({"type": "answer", "text": quick, "intent": intent, "sources": []}, ensure_ascii=False) + "\n"
             return
 
-        results = self.kb.search(question, top_k=5)
+        results = self.kb.search(question, top_k=15, expand=True)
+        results = self._rerank(question, results, top_k=5)
         if not results:
             yield json.dumps({"type": "answer", "text": "抱歉，知识库中暂未找到相关信息。", "intent": "rag", "sources": []}, ensure_ascii=False) + "\n"
             return
@@ -430,7 +521,7 @@ class RAGEngine:
 # FastAPI 应用
 # ============================================================
 
-app = FastAPI(title="RAG 智能客服 API", version="3.0.0")
+app = FastAPI(title="RAG 智能客服 API", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # 限流
@@ -471,7 +562,7 @@ def health():
     return {
         "status": "ok",
         "service": "rag-customer-service",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "redis": cache.enabled,
         "cache_stats": cache.stats(),
         "knowledge": kb.stats(),
@@ -579,14 +670,14 @@ def cache_clear():
 if __name__ == "__main__":
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="RAG 智能客服 v3.0")
+    parser = argparse.ArgumentParser(description="RAG 智能客服 v4.0")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=8901, help="监听端口")
     parser.add_argument("--workers", type=int, default=1, help="Worker 进程数（多进程并发）")
     args = parser.parse_args()
 
     print("=" * 50)
-    print("RAG 智能客服 v3.0")
+    print("RAG 智能客服 v4.0")
     print(f"LLM: {LLM_MODEL} ({LLM_API_BASE})")
     print(f"Embedding: {EMBED_MODEL} ({EMBED_API_BASE})")
     print(f"Redis: {REDIS_URL}")
